@@ -82,6 +82,19 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         self : instance of KNearestNeighbors
             The current instance of the classifier
         """
+        X, y = validate_data(self, X, y)
+
+        # Reject continuous targets: a classifier needs discrete labels
+        is_float = np.issubdtype(y.dtype, np.floating)
+        if is_float and not np.all(y == np.round(y)):
+            raise ValueError(
+                "Unknown label type: continuous target given, "
+                "a classifier needs discrete labels."
+            )
+
+        # Encode labels as 0..n_classes-1 so that np.bincount can be used
+        self.classes_, self.y_train_ = np.unique(y, return_inverse=True)
+        self.X_train_ = X
         return self
 
     def predict(self, X):
@@ -97,8 +110,25 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         y : ndarray, shape (n_test_samples,)
             Predicted class labels for each test data sample.
         """
-        y_pred = np.zeros(X.shape[0])
-        return y_pred
+        check_is_fitted(self, ["X_train_", "y_train_", "classes_"])
+        X = validate_data(self, X, reset=False)
+
+        # Euclidean distance between each test sample and each train sample
+        distances = pairwise_distances(X, self.X_train_)
+
+        # Indices of the k closest training samples for each test sample
+        k_nearest = np.argsort(distances, axis=1)[:, :self.n_neighbors]
+        k_labels = self.y_train_[k_nearest]
+
+        # Majority vote among the k neighbors
+        n_classes = len(self.classes_)
+        y_idx = np.array(
+            [np.bincount(row, minlength=n_classes).argmax()
+             for row in k_labels]
+        )
+
+        # Map class indices back to the original labels
+        return self.classes_[y_idx]
 
     def score(self, X, y):
         """Calculate the score of the prediction.
@@ -111,11 +141,12 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
             target values.
 
         Returns
-        ----------
+        -------
         score : float
             Accuracy of the model computed for the (X, y) pairs.
         """
-        return 0.
+        y_pred = self.predict(X)
+        return float(np.mean(y_pred == np.asarray(y)))
 
 
 class MonthlySplit(BaseCrossValidator):
@@ -137,6 +168,19 @@ class MonthlySplit(BaseCrossValidator):
     def __init__(self, time_col='index'):  # noqa: D107
         self.time_col = time_col
 
+    def _get_months(self, X):
+        """Return the month (as a Period) of each sample."""
+        if self.time_col == 'index':
+            dates = X.index
+        else:
+            dates = X[self.time_col]
+
+        if not pd.api.types.is_datetime64_any_dtype(dates):
+            raise ValueError(
+                f"'{self.time_col}' must be of datetime type."
+            )
+        return pd.DatetimeIndex(dates).to_period('M')
+
     def get_n_splits(self, X, y=None, groups=None):
         """Return the number of splitting iterations in the cross-validator.
 
@@ -155,9 +199,10 @@ class MonthlySplit(BaseCrossValidator):
         n_splits : int
             The number of splits.
         """
-        return 0
+        months = self._get_months(X).unique()
+        return max(len(months) - 1, 0)
 
-    def split(self, X, y, groups=None):
+    def split(self, X, y=None, groups=None):
         """Generate indices to split data into training and test set.
 
         Parameters
@@ -177,12 +222,11 @@ class MonthlySplit(BaseCrossValidator):
         idx_test : ndarray
             The testing set indices for that split.
         """
+        periods = self._get_months(X)
+        months = periods.unique().sort_values()
 
-        n_samples = X.shape[0]
-        n_splits = self.get_n_splits(X, y, groups)
-        for i in range(n_splits):
-            idx_train = range(n_samples)
-            idx_test = range(n_samples)
-            yield (
-                idx_train, idx_test
-            )
+        # Train on month i, test on month i + 1
+        for i in range(len(months) - 1):
+            idx_train = np.where(periods == months[i])[0]
+            idx_test = np.where(periods == months[i + 1])[0]
+            yield idx_train, idx_test
